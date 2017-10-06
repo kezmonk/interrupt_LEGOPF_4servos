@@ -1,0 +1,263 @@
+#include <Servo.h>
+
+//---IR times (38 KHz), this matches the LEGO powerfunctions version 1.20----------------------------------
+#define LEGO_PF_IR_LOW_MIN          410
+#define LEGO_PF_IR_LOW_MAX          460
+#define LEGO_PF_IR_HIGH_MIN         710
+#define LEGO_PF_IR_HIGH_MAX         740
+#define LEGO_PF_IR_START_MIN       1200
+#define LEGO_PF_IR_START_MAX       1240
+#define LEGO_PF_IR_GAP_MIN        39000
+#define LEGO_PF_IR_GAP_MAX       139000
+
+//- Data codes - 
+#define B_OFF 0
+#define A_OFF 0
+#define B_FWD 64
+#define A_FWD 16
+#define B_REV 128
+#define A_REV 32
+#define B_ON_FLOAT 192 //I dont actually see these ever
+#define A_ON_FLOAT 48  //I dont actually see these ever
+#define CHANNEL_1 0
+#define CHANNEL_2 4096
+#define CHANNEL_3 8192
+#define CHANNEL_4 12288
+#define MODE_COMBO 256
+
+//servos
+Servo myServoOnPin9;  //this is the servo for CH1/2, on ~9
+Servo myServoOnPin10;  //this is the servo for CH1/2, on ~10
+Servo myServoOnPin5;  //this is the servo for CH3/4, on ~5
+Servo myServoOnPin6;  //this is the servo for CH3/4, on ~6
+const byte servoStepSize = 30;
+
+//time capture
+unsigned long currTime;
+unsigned long prevTime;
+unsigned long timeDiff;
+
+//pulse capture
+const int FLASH_LIMIT = 35;
+unsigned long flashes[FLASH_LIMIT+1]; //this collects two complete bursts
+unsigned int NibblesAndBytes = 0; //I will use this, and modify it using BitManipulation
+
+//control variables
+const byte ledPin = 13; //flashes for debugging/feedback when receiving mssg //warning! will not work if you use timers, use a different pin
+const byte interruptPin = 2;
+volatile byte collecting = 1;
+volatile byte state = LOW;
+volatile unsigned int flashesCtr = 0;
+
+//----------------------- SETUP ------------------------------
+void setup() {
+  //Serial.begin(9600);
+  pinMode(ledPin, OUTPUT);
+  pinMode(interruptPin, INPUT_PULLUP); //we have a constant 5V which is dropped, 3.2 V by the IR
+  attachInterrupt(digitalPinToInterrupt(interruptPin), blink, FALLING );
+  myServoOnPin9.attach(9);
+  myServoOnPin10.attach(10);
+  myServoOnPin5.attach(5);
+  myServoOnPin6.attach(6);
+} //end SETUP
+//-----------------------------------------------------
+
+//------------------------ LOOP -----------------------------
+void loop() {
+     
+  if (collecting == 1){
+     digitalWrite(ledPin, state);
+    }
+    else{
+      // stop interrupts
+      noInterrupts();
+      
+      // process message - is there is a valid code?, then we have it!
+      if (evalArray()){
+       if (maskCheckMode(NibblesAndBytes) == MODE_COMBO) {
+       switch (maskCheckChannel(NibblesAndBytes)) {
+        case CHANNEL_1:
+          dataA_servo(myServoOnPin9,1);
+          dataB_servo(myServoOnPin10,1);
+          break;
+        case CHANNEL_2:
+          dataA_servo(myServoOnPin9,0);
+          dataB_servo(myServoOnPin10,0);        
+          break;
+        case CHANNEL_3:
+          dataA_servo(myServoOnPin5,1);
+          dataB_servo(myServoOnPin6,1);         
+          break;
+        case CHANNEL_4:
+          dataA_servo(myServoOnPin5,0);
+          dataB_servo(myServoOnPin6,0);          
+          break;          
+        default:
+          // if nothing else matches, do the default
+        break;
+        }//end switch for channel                 
+       }//if then, MODE check
+     }//end evalArray signal
+            
+      // reset counters
+      flashesCtr = 0;
+      collecting = 1;
+      NibblesAndBytes = 0;
+      
+      //reenable interrupts
+      interrupts();      
+      } //end if-then collecting      
+      
+} //end LOOP
+
+
+
+//-------  functions functions functions ---------------------
+
+
+//-------- servo A ----------------------------
+void dataA_servo(Servo myServoObj, byte _returnCenter){
+       switch (maskCheckDataA(NibblesAndBytes)) {
+        case A_OFF:
+           if (_returnCenter == 1) {myServoObj.write(89);} //this is sent/recieved
+          break;
+        case A_FWD:
+         moveServo(myServoObj, 1);       
+          break;
+        case A_REV:
+         moveServo(myServoObj, -1);           
+          break;
+        case A_ON_FLOAT:
+          //if (_returnCenter == 1) {myServoObj.write(89);}   //was not sent/recieved?
+          break;          
+        default:
+          break;
+        }//end switch
+  }//end dataA
+//---------- servo B ---------------------------------------------
+void dataB_servo(Servo myServoObj, byte _returnCenter){
+       switch (maskCheckDataB(NibblesAndBytes)) {
+        case B_OFF:
+          if (_returnCenter == 1) {myServoObj.write(89);} //this is sent/recieved
+          break;
+        case B_FWD:
+          moveServo(myServoObj, 1);           
+          break;
+        case B_REV:
+          moveServo(myServoObj, -1);           
+          break;
+        case B_ON_FLOAT:
+          //if (_returnCenter == 1) {myServoObj.write(89);} //was not sent/recieved?
+          break;          
+        default:
+          break;
+        }//end switch   
+  }//end dataB
+
+
+boolean evalArray(){
+  //this tests for valid signals and sets bits in an unsigned int
+  //the unsigned int is reinitialized to 0 each time, so...mode should be checked to make sure a real signal was sent
+    int countTo = FLASH_LIMIT+1;
+    byte startFound = 0;
+    boolean foundSignal = false;
+    byte lengthCtr = 16;
+    
+   for (int x=0; x < countTo; x++){
+     if (startFound == 0){
+     if (withinRange(flashes[x],LEGO_PF_IR_START_MIN,LEGO_PF_IR_START_MAX)){
+       startFound = 1;
+       //Serial.println("start found");
+       }
+     }//startFound, but need to check if there is a valid number follwing it, otherwise, abort and look for the next
+     else{
+       if (withinRange(flashes[x],LEGO_PF_IR_LOW_MIN,LEGO_PF_IR_HIGH_MAX)){
+         //now add values to the unsigned it where we are keeping it., we can push them on         
+          
+          lengthCtr--;
+                             
+          /* do ntohing since I set it to zero anyway unless ....*/
+        
+         if (withinRange(flashes[x],LEGO_PF_IR_HIGH_MIN,LEGO_PF_IR_HIGH_MAX)){  
+           NibblesAndBytes |= 1 << lengthCtr;            
+           }
+                  
+         } else if (withinRange(flashes[x],LEGO_PF_IR_GAP_MIN,LEGO_PF_IR_GAP_MAX)) { 
+         //maybe it is the gap? 
+         if (lengthCtr == 0) {
+           foundSignal = true;
+           break; //we have a full signal, time to use it
+         }
+         }else{ startFound = 0; lengthCtr = 16;}       
+       }//end collecting
+     
+    }//loop counter
+  return foundSignal;
+  }//end function
+
+
+
+void blink() {
+  state = !state; //flashes an LED for visual feedback
+  currTime = micros();
+  timeDiff = currTime - prevTime;
+  // add values to an array
+  flashes[flashesCtr] = timeDiff;
+  flashesCtr++;
+  if  (flashesCtr == FLASH_LIMIT){collecting = 0;}   
+  prevTime = currTime;
+} //end blink
+
+
+boolean withinRange(unsigned long val, unsigned long MIN, unsigned long MAX){
+   if (val < MAX) { 
+     if (val > MIN) {
+       return true;
+     }
+     else {return false;} 
+     } 
+   else {return false;} 
+  } //end inRange
+  
+
+void moveServo(Servo myServoObj, int _direction){
+  //direction should be 1 or -1
+   int armAngle = myServoObj.read();
+   int moveBy =  servoStepSize * _direction;
+   
+   armAngle = armAngle + moveBy;
+   if ((_direction == 1)&&(armAngle > 179)) {armAngle=179;}
+   if ((_direction == -1)&&(armAngle < 0)) {armAngle=0;}
+    
+   myServoObj.write(armAngle);
+   delay(15);
+ } //end moveServo
+  
+  
+unsigned int maskCheckMode(unsigned int _signal){
+  // mask 0000011100000000
+  unsigned int mask_int = 0b0000011100000000;
+  _signal = _signal & mask_int; //binary AND, if 1 & 1 -> 1, else 0;
+  return _signal;
+  }
+
+unsigned int maskCheckDataA(unsigned int _signal){
+  // mask 0000000000110000
+  unsigned int mask_int = 0b0000000000110000;
+  _signal = _signal & mask_int; //binary AND, if 1 & 1 -> 1, else 0;
+  return _signal;  
+  }
+  
+unsigned int maskCheckDataB(unsigned int _signal){
+  // mask 0000000011000000
+  unsigned int mask_int = 0b0000000011000000;
+  _signal = _signal & mask_int; //binary AND, if 1 & 1 -> 1, else 0;
+  return _signal;  
+  }
+  
+unsigned int maskCheckChannel(unsigned int _signal){
+  // mask 0011000000000000
+  unsigned int mask_int = 0b0011000000000000;
+  _signal = _signal & mask_int; //binary AND, if 1 & 1 -> 1, else 0;
+  return _signal;  
+  }  
